@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Polymarket Overlay</title>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    width: 340px; padding: 14px; color: #fff;
+    background: #141d29;
+    font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  h1 { font-size: 14px; display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+  .mark { width: 20px; height: 20px; border-radius: 6px; background: #2e5cff; display: grid; place-items: center; font-weight: 900; font-size: 12px; }
+  p.sub { color: #93a1b1; font-size: 11.5px; margin-bottom: 10px; }
+  form { display: flex; gap: 6px; }
+  input[type="text"] {
+    flex: 1; min-width: 0; background: rgba(0,0,0,0.3); color: #fff;
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 9px; padding: 8px 10px; font-size: 12px; outline: none;
+  }
+  input[type="text"]:focus { border-color: #2e5cff; }
+  button.go { background: #2e5cff; color: #fff; border: none; font-weight: 700; border-radius: 9px; padding: 8px 13px; cursor: pointer; font-size: 12px; }
+  button.go:hover { background: #4470ff; }
+  .row { display: flex; gap: 6px; margin-top: 8px; }
+  button.ghost {
+    flex: 1; background: rgba(255,255,255,0.06); color: #dbe4ee; border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 9px; padding: 7px 8px; cursor: pointer; font-size: 11.5px; font-weight: 600;
+  }
+  button.ghost:hover { background: rgba(255,255,255,0.12); }
+  #detected { display: none; margin-top: 10px; background: rgba(39,174,96,0.12); border: 1px solid rgba(39,174,96,0.35); color: #b9f2cf; border-radius: 9px; padding: 8px 10px; font-size: 11.5px; cursor: pointer; width: 100%; text-align: left; }
+  #detected:hover { background: rgba(39,174,96,0.2); }
+  h2 { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.7px; color: #93a1b1; margin: 12px 0 5px; }
+  #recent { list-style: none; padding: 0; }
+  #recent li { padding: 6px 8px; border-radius: 8px; cursor: pointer; font-size: 11.5px; color: #cfd9e3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #recent li:hover { background: rgba(255,255,255,0.07); }
+  #recent li.empty { color: #67788c; cursor: default; }
+  label.opt { display: flex; align-items: center; gap: 7px; margin-top: 10px; font-size: 11.5px; color: #cfd9e3; cursor: pointer; }
+  .hint { margin-top: 10px; font-size: 10.5px; color: #67788c; }
+  kbd { background: rgba(255,255,255,0.1); border-radius: 4px; padding: 0 5px; font-family: inherit; }
+  #msg { margin-top: 8px; font-size: 11.5px; color: #ff6b6f; min-height: 14px; }
+</style>
+</head>
+<body>
+  <h1><span class="mark">P</span> Polymarket Overlay</h1>
+  <p class="sub">Pin a transparent, live order-book overlay of any Polymarket market on top of the current page.</p>
+  <form id="form">
+    <input id="url" type="text" spellcheck="false" placeholder="polymarket.com or polymarket.us URL…" autofocus>
+    <button class="go" type="submit">Overlay</button>
+  </form>
+  <button id="detected" type="button"></button>
+  <div class="row">
+    <button class="ghost" id="toggleBtn" type="button">Toggle on this tab</button>
+    <button class="ghost" id="fullBtn" type="button">Open full page</button>
+  </div>
+  <h2>Recent markets</h2>
+  <ul id="recent"></ul>
+  <label class="opt"><input type="checkbox" id="autoShow"> Auto-open overlay on Polymarket market pages</label>
+  <div id="msg"></div>
+  <p class="hint">Tip: <kbd>Alt</kbd>+<kbd>P</kbd> toggles the overlay anywhere. Drag its header to move, ⤡ to resize.</p>
+  <script src="popup.js"></script>
+</body>
+</html>
