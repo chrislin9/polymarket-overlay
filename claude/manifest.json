@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Polymarket Live Overlay",
+  "version": "1.1.0",
+  "description": "Float a transparent, resizable, live Polymarket (polymarket.com or polymarket.us) market overlay with chart and real-time order books on any page.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "action": {
+    "default_title": "Polymarket Live Overlay",
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "activeTab",
+    "scripting",
+    "storage",
+    "contextMenus"
+  ],
+  "host_permissions": [
+    "https://gamma-api.polymarket.com/*",
+    "https://clob.polymarket.com/*",
+    "https://gateway.polymarket.us/*",
+    "https://gateway-ws-markets.polymarket.us/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "overlay/*",
+        "lib/*"
+      ],
+      "matches": [
+        "<all_urls>"
+      ]
+    }
+  ]
+}

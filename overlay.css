@@ -1,10 +1,13 @@
 /* Polymarket Overlay — styles live inside a Shadow DOM root.
-   --pm-alpha controls panel transparency from the opacity slider. */
+   --pm-alpha / --pm-blur are driven by the opacity slider (see
+   opacityState in overlay.js): the slider reaches 0 (fully translucent),
+   and the backdrop blur ramps to 0 with it so video stays watchable. */
 :host { all: initial; }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 .pm-root {
   --pm-alpha: 0.88;
+  --pm-blur: 14px;
   --green: #27ae60;
   --green-bright: #2ecc71;
   --red: #e6484d;
@@ -20,8 +23,8 @@
   height: 100%;
   min-height: 0;
   background: rgba(20, 29, 41, var(--pm-alpha));
-  backdrop-filter: blur(14px) saturate(1.3);
-  -webkit-backdrop-filter: blur(14px) saturate(1.3);
+  backdrop-filter: blur(var(--pm-blur)) saturate(1.3);
+  -webkit-backdrop-filter: blur(var(--pm-blur)) saturate(1.3);
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 14px;
   box-shadow: 0 18px 50px rgba(0, 0, 0, 0.55), 0 2px 10px rgba(0, 0, 0, 0.4);
@@ -32,6 +35,18 @@
 }
 .pm-root.pm-standalone { border-radius: 0; border: none; box-shadow: none; }
 .pm-root.pm-glass { background: rgba(20, 29, 41, calc(var(--pm-alpha) * 0.55)); }
+
+/* Mostly-transparent panel (effective alpha < 55%): keep text legible over
+   bright pages/video and the panel edge findable; the expanded order book
+   keeps a slightly deeper slab so its numbers stay readable. */
+.pm-root.pm-see-through { text-shadow: 0 0 3px rgba(0, 0, 0, 0.9), 0 0 1px rgba(0, 0, 0, 1); border-color: rgba(255, 255, 255, 0.28); }
+.pm-root.pm-see-through .pm-go, .pm-root.pm-see-through .pm-sample-tag, .pm-root.pm-see-through .pm-us-tag { text-shadow: none; }
+.pm-root.pm-see-through .pm-book { background: rgba(13, 20, 29, calc(var(--pm-alpha) + 0.25)); }
+
+/* Ghost (click-through) mode: pointer-events are toggled in overlay.js
+   (frame none, header bar auto); the dashed, shadowless edge marks it. */
+.pm-root.pm-ghost { border-style: dashed; box-shadow: none; }
+.pm-root.pm-ghost .pm-resize { display: none; }
 
 button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
 input { font: inherit; color: #fff; }
@@ -63,6 +78,7 @@ input { font: inherit; color: #fff; }
 }
 .pm-icon-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
 .pm-icon-btn.active { background: rgba(46,92,255,0.35); color: #fff; }
+.pm-icon-btn svg { width: 14px; height: 14px; display: block; }
 
 /* ---------- URL loader ---------- */
 .pm-loader { display: flex; gap: 6px; padding: 10px 12px 4px; flex: none; }
@@ -174,8 +190,18 @@ input { font: inherit; color: #fff; }
 .pm-lvl.bid .px { color: var(--green-bright); }
 .pm-lvl .sz, .pm-lvl .tot { text-align: right; color: #dbe4ee; }
 .pm-lvl .tot { color: var(--muted); }
-.pm-lvl.changed { animation: pm-lvlflash 0.55s; }
-@keyframes pm-lvlflash { 0% { background: rgba(255,255,255,0.14); } 100% { background: transparent; } }
+/* Level flash overlay: green when size grows / a bid level appears, red
+   when it shrinks (filled or cancelled) / an ask level appears. The row
+   HTML carries a negative animation-delay so the flash resumes at the
+   right point across re-renders (FLASH_MS in overlay.js). */
+.pm-lvl .fl { position: absolute; top: 1px; bottom: 1px; left: 0; right: 0; border-radius: 4px; pointer-events: none; opacity: 0; z-index: 0; }
+.pm-lvl .fl.up { background: rgba(39, 174, 96, 0.38); animation: pm-fl 0.9s ease-out; }
+.pm-lvl .fl.down { background: rgba(230, 72, 77, 0.38); animation: pm-fl 0.9s ease-out; }
+@keyframes pm-fl { 0% { opacity: 1; } 100% { opacity: 0; } }
+.pm-spread b.pm-trade-up { animation: pm-tu 1.2s ease-out; }
+.pm-spread b.pm-trade-down { animation: pm-td 1.2s ease-out; }
+@keyframes pm-tu { 0% { color: #2ecc71; } 100% {} }
+@keyframes pm-td { 0% { color: #ff6b6f; } 100% {} }
 .pm-spread {
   display: flex; gap: 14px; justify-content: center; align-items: center;
   padding: 5px 4px; margin: 3px 0; border-top: 1px dashed rgba(255,255,255,0.12);

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Polymarket Overlay — Live Order Book",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Paste a live Polymarket market URL and pin a transparent, resizable, always-on-top overlay with live-updating order books on any page.",
   "icons": {
     "16": "icons/icon16.png",

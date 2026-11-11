@@ -49,6 +49,58 @@
   var TOP_N = 12;          // legs shown before "show all"
   var MAX_SUBS = 90;       // cap on live token subscriptions
 
+  /* ---------- pure helpers (unit-tested via PMOverlay._test) ---------- */
+  var FLASH_MS = 900;      // order-book level flash duration
+
+  /* Diff one book side against the previous render. Mutates prevSizes
+     (key "side@price" -> size) and flashes (key -> {dir, t}): a level that
+     shrank (filled or cancelled) flashes "down", one that grew flashes
+     "up", and a brand-new level flashes by side (bids up, asks down).
+     Levels absent from `levels` are pruned, so a level that returns after
+     being fully cancelled counts as new again. Nothing flashes until the
+     view is primed, so the initial snapshot doesn't strobe. */
+  function classifyLevelChanges(prevSizes, flashes, side, levels, primed, now) {
+    var seen = new Set();
+    levels.forEach(function (l) {
+      var key = side + "@" + l.price;
+      seen.add(key);
+      var prev = prevSizes.has(key) ? prevSizes.get(key) : null;
+      if (primed) {
+        if (prev == null) flashes.set(key, { dir: side === "asks" ? "down" : "up", t: now });
+        else if (l.size !== prev) flashes.set(key, { dir: l.size > prev ? "up" : "down", t: now });
+      }
+      prevSizes.set(key, l.size);
+    });
+    prevSizes.forEach(function (_v, key) {
+      if (key.indexOf(side + "@") === 0 && !seen.has(key)) { prevSizes.delete(key); flashes.delete(key); }
+    });
+    flashes.forEach(function (f, key) { if (now - f.t >= FLASH_MS) flashes.delete(key); });
+  }
+
+  /* Opacity slider state. alpha is the raw 0..1 panel opacity (0 = fully
+     translucent); glass mode scales the effective background to 55%.
+     The backdrop blur ramps down as the panel fades (full 14px at >= 50%
+     effective, 0 at 0%) so a video underneath stays watchable instead of
+     frosted. Below 55% effective the panel is "see-through" (text shadow
+     + stronger border keep it legible/findable). */
+  function opacityState(pct, glass) {
+    var alpha = Math.min(100, Math.max(0, +pct || 0)) / 100;
+    var effective = glass ? alpha * 0.55 : alpha;
+    return {
+      alpha: alpha,
+      effective: effective,
+      blurPx: Math.round(Math.min(14, effective * 28)),
+      seeThrough: effective < 0.55,
+    };
+  }
+
+  /* Ghost (click-through) mode: the frame stops capturing the mouse so
+     clicks/scroll reach the page underneath; only the header bar stays
+     interactive (to drag the panel or switch ghost mode back off). */
+  function ghostPointerEvents(on) {
+    return on ? { frame: "none", bar: "auto" } : { frame: "", bar: "" };
+  }
+
   function create(container, opts) {
     opts = opts || {};
     var storage = opts.storage || { get: function () { return Promise.resolve({}); }, set: function () {} };
@@ -65,6 +117,8 @@
         '<span class="pm-logo"><span class="pm-logo-mark">P</span>Polymarket</span>' +
         '<span class="pm-live"><span class="dot"></span><span class="pm-live-txt">Idle</span></span>' +
         '<span class="pm-bar-spacer"></span>' +
+        '<button class="pm-icon-btn" data-act="ghost" aria-pressed="false" title="Ghost mode: click through to the page underneath (header stays clickable)">' +
+          '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M3 14V7a5 5 0 0 1 10 0v7l-2-1.5L9.5 14 8 12.5 6.5 14 5 12.5z"/><circle cx="6.2" cy="7" r=".8" fill="currentColor"/><circle cx="9.8" cy="7" r=".8" fill="currentColor"/></svg></button>' +
         '<button class="pm-icon-btn" data-act="glass" title="Extra transparency">◐</button>' +
         '<button class="pm-icon-btn" data-act="min" title="Minimize">–</button>' +
         '<button class="pm-icon-btn" data-act="close" title="Close overlay (Alt+P)">✕</button>' +
@@ -74,7 +128,7 @@
       '<div class="pm-status"></div>' +
       '<div class="pm-body"></div>' +
       '<div class="pm-foot">' +
-        '<label>Opacity <input type="range" min="25" max="100" value="88"></label>' +
+        '<label>Opacity <input type="range" min="0" max="100" value="88"></label>' +
         '<span class="pm-src">Gamma + CLOB · live via WebSocket</span>' +
       "</div>" +
       '<div class="pm-resize" title="Drag to resize">⤡</div>';
@@ -90,6 +144,7 @@
       status: root.querySelector(".pm-status"),
       body: root.querySelector(".pm-body"),
       opacity: root.querySelector('.pm-foot input[type="range"]'),
+      ghostBtn: root.querySelector('[data-act="ghost"]'),
       resize: root.querySelector(".pm-resize"),
       src: root.querySelector(".pm-src"),
     };
@@ -111,6 +166,7 @@
       socket: null, socketLive: false,
       timers: [], rafBooks: new Set(), rafPending: false,
       destroyed: false, sampleTimer: null,
+      ghost: false,
       chartHoverX: null,
       gen: 0, // bumped on every load; guards the async init below
     };
@@ -371,6 +427,10 @@
         spread: refs.slot.querySelector(".pm-spread"),
         meta: refs.slot.querySelector('[data-r="bookMeta"]'),
         prevSizes: new Map(),
+        flashes: new Map(), // "side@price" -> {dir, t} (see classifyLevelChanges)
+        primed: false,      // true after the first render with a book
+        lastTradeTs: 0,
+        tradeFlash: null,   // {dir, t} for the Last-price cell
       };
       refs.slot.querySelectorAll(".pm-depth-sel button").forEach(function (b) {
         b.addEventListener("click", function () {
@@ -410,8 +470,15 @@
         br.spread.innerHTML = "";
         return;
       }
-      var asks = bookLevels(book, "asks").slice(0, S.depth);
-      var bids = bookLevels(book, "bids").slice(0, S.depth);
+      var now = Date.now();
+      var allAsks = bookLevels(book, "asks"), allBids = bookLevels(book, "bids");
+      // Flash levels whose size changed since the last render (a shrink =
+      // filled or cancelled). Diff the full book, not just the visible
+      // slice, so levels entering the visible range don't flash as "new".
+      classifyLevelChanges(br.prevSizes, br.flashes, "asks", allAsks, br.primed, now);
+      classifyLevelChanges(br.prevSizes, br.flashes, "bids", allBids, br.primed, now);
+      var asks = allAsks.slice(0, S.depth);
+      var bids = allBids.slice(0, S.depth);
       // cum = cumulative shares for the depth bar; cumUsd = Σ price·size (cost to sweep here)
       var maxCum = 0, cum = 0, cumUsd = 0;
       asks.forEach(function (l) { cum += l.size; l.cum = cum; cumUsd += l.price * l.size; l.cumUsd = cumUsd; });
@@ -420,12 +487,15 @@
       maxCum = Math.max(maxCum, cum, 1);
 
       function row(l, side) {
-        var key = side + "@" + l.price;
-        var changed = br.prevSizes.has(key) && br.prevSizes.get(key) !== l.size;
-        br.prevSizes.set(key, l.size);
+        // Rows are rebuilt as HTML on every render, so a running flash is
+        // resumed mid-animation with a negative delay instead of restarting
+        // (or being cut short) on each book update.
+        var f = br.flashes.get(side + "@" + l.price);
+        var fl = f && now - f.t < FLASH_MS
+          ? '<span class="fl ' + f.dir + '" style="animation-delay:-' + (now - f.t) + 'ms"></span>' : "";
         var pctW = Math.max(1.5, (l.cum / maxCum) * 100);
-        return '<div class="pm-lvl ' + (side === "asks" ? "ask" : "bid") + (changed ? " changed" : "") + '">' +
-          '<span class="bar" style="width:' + pctW.toFixed(1) + '%"></span>' +
+        return '<div class="pm-lvl ' + (side === "asks" ? "ask" : "bid") + '">' +
+          '<span class="bar" style="width:' + pctW.toFixed(1) + '%"></span>' + fl +
           '<span class="px">' + fmtCents(l.price) + "</span><span></span>" +
           '<span class="sz">' + fmtShares(l.size) + "</span>" +
           '<span class="tot">' + fmtMoney(l.cumUsd) + "</span></div>";
@@ -440,13 +510,27 @@
       var bestBid = bids[0] && bids[0].price, bestAsk = asks[0] && asks[0].price;
       var spread = bestBid != null && bestAsk != null ? bestAsk - bestBid : null;
       var mid = spread != null ? (bestBid + bestAsk) / 2 : null;
+      // A fresh trade (a filled order) flashes the Last price green (buy)
+      // or red (sell), resumed across re-renders like the level flashes.
+      if (book.lastTrade && book.lastTrade.ts && book.lastTrade.ts !== br.lastTradeTs) {
+        br.lastTradeTs = book.lastTrade.ts;
+        br.tradeFlash = {
+          dir: String(book.lastTrade.side || "").toUpperCase() === "SELL" ? "down" : "up",
+          t: book.lastTrade.ts,
+        };
+      }
+      if (br.tradeFlash && now - br.tradeFlash.t >= 1200) br.tradeFlash = null;
+      var lastB = br.tradeFlash
+        ? '<b class="pm-trade-' + br.tradeFlash.dir + '" style="animation-delay:-' + (now - br.tradeFlash.t) + 'ms">'
+        : "<b>";
       br.spread.innerHTML =
         "<span>Spread <b>" + (spread != null ? fmtCents(spread) : "—") + "</b></span>" +
         "<span>Mid <b>" + (mid != null ? fmtCents(mid) : "—") + "</b></span>" +
-        "<span>Last <b>" + (book.last != null ? fmtCents(book.last) : "—") + "</b></span>";
+        "<span>Last " + lastB + (book.last != null ? fmtCents(book.last) : "—") + "</b></span>";
       br.meta.textContent = "Tick " + fmtCents(book.tick || 0.01) + " · " +
         (S.sample ? "simulated" : leg.market.source === "us" ? "US · polling" : S.socketLive ? "live" : "REST") +
         " · updated " + new Date(book.ts).toLocaleTimeString([], { hour12: false });
+      br.primed = true;
     }
 
     function queueBookRender(tokenId) {
@@ -539,7 +623,10 @@
         q2.last = API.num(msg.price);
         S.quotes.set(t2, q2);
         var b2 = S.books.get(t2);
-        if (b2) { b2.last = q2.last; b2.ts = Date.now(); }
+        if (b2) {
+          b2.last = q2.last; b2.ts = Date.now();
+          b2.lastTrade = { price: q2.last, side: msg.side || null, size: API.num(msg.size), ts: b2.ts };
+        }
         updateLivePx(t2);
         queueBookRender(t2);
       } else if (type === "tick_size_change") {
@@ -899,14 +986,44 @@
 
     /* ---------- chrome (bar buttons, form, opacity, drag/resize) ---------- */
     el.form.addEventListener("submit", function (e) { e.preventDefault(); loadUrl(el.input.value); });
+
+    function applyOpacity() {
+      var st = opacityState(+el.opacity.value, root.classList.contains("pm-glass"));
+      root.style.setProperty("--pm-alpha", st.alpha.toFixed(2));
+      root.style.setProperty("--pm-blur", st.blurPx + "px");
+      root.classList.toggle("pm-see-through", st.seeThrough);
+    }
     el.opacity.addEventListener("input", function () {
-      root.style.setProperty("--pm-alpha", (el.opacity.value / 100).toFixed(2));
+      applyOpacity();
       storage.set({ pmOpacity: +el.opacity.value });
     });
     root.querySelector('[data-act="glass"]').addEventListener("click", function (e) {
       root.classList.toggle("pm-glass");
       e.currentTarget.classList.toggle("active", root.classList.contains("pm-glass"));
+      applyOpacity();
     });
+
+    /* Ghost mode: clicks/scroll pass through to the page underneath; only
+       the header bar still captures the mouse (drag it, or click the ghost
+       button again to exit). Needs a frame element to float over a page,
+       so the button is hidden in standalone full-page mode. Not persisted:
+       a fresh panel always starts solid. */
+    function setGhost(on) {
+      S.ghost = !!on;
+      root.classList.toggle("pm-ghost", S.ghost);
+      if (el.ghostBtn) {
+        el.ghostBtn.classList.toggle("active", S.ghost);
+        el.ghostBtn.setAttribute("aria-pressed", String(S.ghost));
+      }
+      var pe = ghostPointerEvents(S.ghost);
+      if (opts.frameEl) opts.frameEl.style.pointerEvents = pe.frame;
+      el.bar.style.pointerEvents = pe.bar;
+    }
+    if (el.ghostBtn) {
+      if (opts.frameEl) el.ghostBtn.addEventListener("click", function () { setGhost(!S.ghost); });
+      else el.ghostBtn.style.display = "none";
+    }
+    applyOpacity();
     root.querySelector('[data-act="min"]').addEventListener("click", function () {
       root.classList.toggle("pm-minimized");
       if (opts.frameEl) opts.frameEl.style.height = root.classList.contains("pm-minimized") ? "44px" : (opts.frameEl.dataset.h || "640px");
@@ -990,7 +1107,7 @@
     /* ---------- init ---------- */
     storage.get(["pmOpacity", "pmRange", "pmDepth", "pmLastUrl"]).then(function (cfg) {
       cfg = cfg || {};
-      if (cfg.pmOpacity) { el.opacity.value = cfg.pmOpacity; root.style.setProperty("--pm-alpha", (cfg.pmOpacity / 100).toFixed(2)); }
+      if (cfg.pmOpacity != null) { el.opacity.value = cfg.pmOpacity; applyOpacity(); }
       if (cfg.pmRange && RANGES.indexOf(cfg.pmRange) !== -1) S.range = cfg.pmRange;
       if (cfg.pmDepth) S.depth = cfg.pmDepth;
       if (S.gen !== 0 || S.ev) return; // a load already started before settings resolved
@@ -1003,18 +1120,28 @@
       root: root,
       loadUrl: loadUrl,
       loadSample: loadSample,
+      setGhost: setGhost,
       focusInput: function () { el.input.focus(); el.input.select(); },
       destroy: function () {
         S.destroyed = true;
         resetMarketState();
         window.removeEventListener("resize", drawChart);
+        if (opts.frameEl) opts.frameEl.style.pointerEvents = "";
         root.remove();
       },
       _state: S,
     };
   }
 
-  window.PMOverlay = { create: create };
+  window.PMOverlay = {
+    create: create,
+    _test: {
+      FLASH_MS: FLASH_MS,
+      classifyLevelChanges: classifyLevelChanges,
+      opacityState: opacityState,
+      ghostPointerEvents: ghostPointerEvents,
+    },
+  };
 })();
 
 

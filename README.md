@@ -16,9 +16,10 @@ Paste any live Polymarket market URL — **polymarket.com or polymarket.us** —
 - **In the overlay:**
   - Paste a different URL in the top field to switch markets without reopening.
   - **Chart** — price history for the focused leg (1H / 6H / 1D / 1W / 1M / ALL), hover for values; expanding a leg focuses the chart on it. The dashed line tracks the live price.
-  - **Legs** — click any row to expand its order book: depth bars, shares, cumulative total, spread / mid / last trade, Yes/No book toggle, 5/8/15 depth. Prices flash green/red as they move. Multi-outcome events get a filter box and a "show all" expander (sorted by chance, like Polymarket).
+  - **Legs** — click any row to expand its order book: depth bars, shares, cumulative total, spread / mid / last trade, Yes/No book toggle, 5/8/15 depth. Book levels flash as orders change — **green** when a level grows (or a bid level appears), **red** when it shrinks (filled or cancelled) or an ask level appears; a fresh trade also flashes the last price green (buy) / red (sell). Multi-outcome events get a filter box and a "show all" expander (sorted by chance, like Polymarket).
   - **Drag** the header to move, drag **⤡** (bottom-right) to resize — position, size, opacity, range and depth persist across pages. The panel re-clamps itself into the viewport whenever the window changes (resize, entering/exiting fullscreen, zoom), so the resize corner is always reachable; **double-click the header** to reset size/position to the default dock.
-  - **Opacity slider** (footer) + **◐ glass mode** control transparency; the panel uses backdrop blur so the page stays readable underneath.
+  - **Opacity slider** (footer) runs the full **0–100%** range + **◐ glass mode** for extra transparency. At low opacity the backdrop blur fades out with it, so at ~0% the panel is essentially clear text over the page — readable via a soft text shadow while a video plays underneath.
+  - **Ghost mode** (ghost icon, header) makes the panel **click-through**: clicks and scrolling reach the page underneath, and only the header bar still captures the mouse (drag to move, or click the icon again to exit — the dashed border marks the mode). Not persisted; a fresh panel always starts solid.
   - **–** minimizes to just the header (handy as a price ticker); **✕** hides it (`Alt+P` brings it back).
 
 On pages where injection isn't possible (e.g. `chrome://`), the same UI opens as a full-page tab instead.
@@ -49,4 +50,5 @@ On pages where injection isn't possible (e.g. `chrome://`), the same UI opens as
 - [lib/chart.js](lib/chart.js) — canvas price chart
 - [lib/geom.js](lib/geom.js) — panel geometry clamping (keeps the resize corner on-screen after viewport changes)
 - [test/api-geom.test.cjs](test/api-geom.test.cjs) — unit tests for URL parsing + geometry clamp (`node --test`)
+- [test/overlay-fx.test.cjs](test/overlay-fx.test.cjs) — unit tests for book-flash classification, full-range opacity state, and ghost-mode pointer-events
 - [demo.html](demo.html) — try it without installing: serve this folder (`python3 -m http.server`) and open `demo.html?url=<polymarket-url>` (or `?sample=1` for simulated data)
