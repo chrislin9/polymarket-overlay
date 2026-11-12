@@ -164,6 +164,7 @@
       history: [], historyToken: null,
       showAll: false, filter: "",
       socket: null, socketLive: false,
+      usStream: null,          // US realtime stream (Connect, anonymous)
       timers: [], rafBooks: new Set(), rafPending: false,
       destroyed: false, sampleTimer: null,
       ghost: false,
@@ -280,7 +281,7 @@
         });
       });
       var search = el.body.querySelector(".pm-search");
-      if (search) search.addEventListener("input", function () { S.filter = search.value.trim(); renderLegs(); });
+      if (search) search.addEventListener("input", function () { S.filter = search.value.trim(); renderLegs(); subscribeVisible(); });
       var showAllBtn = el.body.querySelector(".pm-showall");
       if (showAllBtn) showAllBtn.addEventListener("click", function () { S.showAll = !S.showAll; renderLegs(); subscribeVisible(); });
       wireChartHover();
@@ -391,6 +392,7 @@
         refs.legEl.classList.remove("open");
         refs.slot.innerHTML = "";
         refs.bookRefs = null;
+        subscribeVisible();
       } else {
         S.openLegs.add(leg.key);
         refs.legEl.classList.add("open");
@@ -528,7 +530,7 @@
         "<span>Mid <b>" + (mid != null ? fmtCents(mid) : "—") + "</b></span>" +
         "<span>Last " + lastB + (book.last != null ? fmtCents(book.last) : "—") + "</b></span>";
       br.meta.textContent = "Tick " + fmtCents(book.tick || 0.01) + " · " +
-        (S.sample ? "simulated" : leg.market.source === "us" ? "US · polling" : S.socketLive ? "live" : "REST") +
+        (S.sample ? "simulated" : leg.market.source === "us" ? (S.socketLive ? "US · live" : "US · polling") : S.socketLive ? "live" : "REST") +
         " · updated " + new Date(book.ts).toLocaleTimeString([], { hour12: false });
       br.primed = true;
     }
@@ -646,8 +648,58 @@
       });
     }
 
+    /* US: full-book channels for open legs + the chart leg, top-of-book
+       channels for the visible rows. The stream reopens only on change. */
+    function ensureUSStream() {
+      if (S.usStream || S.sample || !isUS() || S.destroyed) return;
+      S.usStream = new API.USMarketStream(onUSStreamMessage, function (status) {
+        if (status === "live") setLive("live", "Live");
+        else if (status === "idle") setLive("idle", "Idle");
+        else setLive("reconnecting", "Reconnecting…");
+      });
+    }
+
+    function subscribeUS() {
+      ensureUSStream();
+      if (!S.usStream) return;
+      var book = [];
+      S.openLegs.forEach(function (key) {
+        var refs = S.legEls.get(key);
+        if (refs) book.push(refs.leg.market.usSlug);
+      });
+      var cl = chartLeg();
+      if (cl) book.push(cl.market.usSlug);
+      var lite = visibleLegs().map(function (l) { return l.market.usSlug; });
+      S.usStream.setChannels(book, lite);
+    }
+
+    function legsForUSSlug(slug) {
+      return S.legs.filter(function (l) { return l.market.usSlug === slug; });
+    }
+
+    function onUSStreamMessage(msg) {
+      if (S.destroyed || !msg.slug) return;
+      var legs = legsForUSSlug(msg.slug);
+      if (!legs.length) return;
+      var m = legs[0].market;
+      if (msg.kind === "book") {
+        applyUSBook(m, msg);
+        return;
+      }
+      // Top of book: token 0 is the long book, token 1 its mirror.
+      var t0 = String(m.tokens[0]), t1 = String(m.tokens[1]);
+      var q0 = S.quotes.get(t0) || {}, q1 = S.quotes.get(t1) || {};
+      if (msg.bestBid != null) { q0.bid = msg.bestBid; q1.ask = +(1 - msg.bestBid).toFixed(4); }
+      if (msg.bestAsk != null) { q0.ask = msg.bestAsk; q1.bid = +(1 - msg.bestAsk).toFixed(4); }
+      if (msg.last != null) { q0.last = msg.last; q1.last = +(1 - msg.last).toFixed(4); }
+      S.quotes.set(t0, q0); S.quotes.set(t1, q1);
+      updateLivePx(t0); updateLivePx(t1);
+      queueBookRender(t0);
+    }
+
     function subscribeVisible() {
-      if (S.sample || isUS()) return;
+      if (S.sample || !S.ev) return;
+      if (isUS()) { subscribeUS(); return; }
       ensureSocket();
       var ids = [];
       visibleLegs().forEach(function (leg) {
@@ -668,18 +720,23 @@
       var m = leg.market;
       if (!m.usSlug) return Promise.resolve();
       return API.fetchUSBook(m.usSlug).then(function (res) {
-        if (S.destroyed) return;
-        m.tokens.forEach(function (tok, i) {
-          var s = res.sides && res.sides[i];
-          if (s) applyBookSnapshot(tok, { bids: s.bids, asks: s.asks, tick: m.tick || 0.01, last: s.lastTradePrice });
-        });
-        if (res.meta && res.meta.notionalTraded != null) {
-          m.volume = res.meta.notionalTraded;
+        if (!S.destroyed) applyUSBook(m, res);
+      }).catch(function () { /* next poll retries */ });
+    }
+
+    /* Book snapshot (stream frame or REST) -> both outcome tokens. */
+    function applyUSBook(m, res) {
+      m.tokens.forEach(function (tok, i) {
+        var s = res.sides && res.sides[i];
+        if (s) applyBookSnapshot(tok, { bids: s.bids, asks: s.asks, tick: m.tick || 0.01, last: s.lastTradePrice });
+      });
+      if (res.meta && res.meta.notionalTraded != null && res.meta.notionalTraded !== m.volume) {
+        m.volume = res.meta.notionalTraded;
+        legsForUSSlug(m.usSlug).forEach(function (leg) {
           var refs = S.legEls.get(leg.key);
           if (refs && refs.sub && !leg.fixedSide) refs.sub.textContent = fmtMoney(m.volume) + " Vol.";
-        }
-        renderBook(leg);
-      }).catch(function () { /* next poll retries */ });
+        });
+      }
     }
 
     function ensureBook(leg) {
@@ -688,7 +745,8 @@
       if (S.sample) { if (!S.books.has(tok)) seedSampleBook(tok); renderBook(leg); return; }
       if (leg.market.source === "us") {
         if (S.books.has(String(tok))) renderBook(leg);
-        refreshUSBook(leg);
+        else refreshUSBook(leg); // seed; the stream takes over once it's live
+        subscribeVisible();
         return;
       }
       ensureSocket();
@@ -713,6 +771,7 @@
       if (S.chartLegKey === key) { paintChartHead(); return; }
       S.chartLegKey = key;
       loadHistory();
+      subscribeVisible();
     }
 
     function loadHistory() {
@@ -800,6 +859,7 @@
     /* ---------- loading ---------- */
     function resetMarketState() {
       if (S.socket) { S.socket.close(); S.socket = null; }
+      if (S.usStream) { S.usStream.close(); S.usStream = null; }
       if (S.sampleTimer) { clearInterval(S.sampleTimer); S.sampleTimer = null; }
       S.timers.forEach(clearInterval); S.timers = [];
       S.books.clear(); S.quotes.clear(); S.livePx.clear();
@@ -820,11 +880,11 @@
           if (tok) API.fetchBook(tok).then(function (s) { applyBookSnapshot(tok, s); }).catch(function () {});
         });
       });
-      // US has no public WebSocket: polling the gateway book IS the live feed.
-      // Rotate through open legs (+ chart leg), at most 2 fetches per 3s tick.
+      // US REST fallback while the realtime stream is down: rotate through
+      // open legs (+ chart leg), at most 2 fetches per 3s tick.
       var usTick = 0;
       every(3000, function () {
-        if (S.sample || !S.ev || !isUS()) return;
+        if (S.sample || !S.ev || !isUS() || S.socketLive) return;
         var targets = [];
         S.openLegs.forEach(function (key) {
           var refs = S.legEls.get(key);
@@ -841,6 +901,7 @@
       // Periodic metadata refresh (prices/volumes) for both sources.
       every(30000, function () {
         if (S.sample || !S.url) return;
+        if (isUS() && S.socketLive) return; // the stream already keeps visible legs live
         API.loadFromUrl(S.url).then(function (fresh) {
           if (S.destroyed || !S.ev) return;
           var byId = new Map(fresh.markets.map(function (m) { return [m.id, m]; }));
@@ -875,10 +936,9 @@
       if (url) storage.set({ pmLastUrl: url });
       setStatus(S.sample ? "Sample market — simulated live feed." : "");
       if (el.src) el.src.textContent = S.sample ? "Simulated feed"
-        : ev.source === "us" ? "Polymarket US gateway · live polling"
+        : ev.source === "us" ? "Polymarket US realtime stream"
         : "Gamma + CLOB · live via WebSocket";
-      if (!S.sample && ev.source === "us") setLive("live", "Live");
-      else if (!S.sample) setLive("reconnecting", "Connecting…");
+      if (!S.sample && !S.socketLive) setLive("reconnecting", "Connecting…");
     }
 
     function loadUrl(url) {

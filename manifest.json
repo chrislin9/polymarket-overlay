@@ -24,7 +24,8 @@
   "host_permissions": [
     "https://gamma-api.polymarket.com/*",
     "https://clob.polymarket.com/*",
-    "https://gateway.polymarket.us/*"
+    "https://gateway.polymarket.us/*",
+    "https://gateway-ws-markets.polymarket.us/*"
   ],
   "content_scripts": [
     {
