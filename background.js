@@ -7,6 +7,7 @@ const ALLOWED_HOSTS = new Set([
   "gamma-api.polymarket.com",
   "clob.polymarket.com",
   "gateway.polymarket.us",
+  "data-api.polymarket.com",
 ]);
 
 async function proxyFetch(url) {
@@ -35,7 +36,7 @@ async function sendToActiveTab(message) {
     try {
       await chrome.scripting.executeScript({
         target: { tabId: tab.id },
-        files: ["lib/geom.js", "lib/api.js", "lib/chart.js", "overlay.js", "content.js"],
+        files: ["lib/geom.js", "lib/api.js", "lib/chart.js", "lib/recorder.js", "overlay.js", "content.js"],
       });
       const res = await chrome.tabs.sendMessage(tab.id, message);
       return { ok: true, tabId: tab.id, res };

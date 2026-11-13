@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Polymarket Overlay — Live Order Book",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Paste a live Polymarket market URL and pin a transparent, resizable, always-on-top overlay with live-updating order books on any page.",
   "icons": {
     "16": "icons/icon16.png",
@@ -25,12 +25,13 @@
     "https://gamma-api.polymarket.com/*",
     "https://clob.polymarket.com/*",
     "https://gateway.polymarket.us/*",
-    "https://gateway-ws-markets.polymarket.us/*"
+    "https://gateway-ws-markets.polymarket.us/*",
+    "https://data-api.polymarket.com/*"
   ],
   "content_scripts": [
     {
       "matches": ["http://*/*", "https://*/*"],
-      "js": ["lib/geom.js", "lib/api.js", "lib/chart.js", "overlay.js", "content.js"],
+      "js": ["lib/geom.js", "lib/api.js", "lib/chart.js", "lib/recorder.js", "overlay.js", "content.js"],
       "run_at": "document_idle"
     }
   ],

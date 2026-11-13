@@ -6,6 +6,7 @@
 * { box-sizing: border-box; margin: 0; padding: 0; }
 
 .pm-root {
+  container-type: inline-size;
   --pm-alpha: 0.88;
   --pm-blur: 14px;
   --green: #27ae60;
@@ -79,6 +80,27 @@ input { font: inherit; color: #fff; }
 .pm-icon-btn:hover { background: rgba(255,255,255,0.1); color: #fff; }
 .pm-icon-btn.active { background: rgba(46,92,255,0.35); color: #fff; }
 .pm-icon-btn svg { width: 14px; height: 14px; display: block; }
+
+/* Record: pill in the header so it stays reachable while minimized.
+   Idle = muted "● REC"; recording = red, pulsing dot, timer + event
+   count; pending-save = last download failed, click retries it. */
+.pm-rec {
+  display: inline-flex; align-items: center; gap: 5px; flex: none;
+  height: 26px; padding: 0 9px; border-radius: 7px;
+  border: 1px solid var(--border); background: rgba(255,255,255,0.04);
+  color: var(--muted); font-size: 10.5px; font-weight: 800; letter-spacing: 0.5px;
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.pm-rec:hover { background: rgba(255,255,255,0.1); color: #fff; }
+.pm-rec-dot { width: 8px; height: 8px; border-radius: 50%; background: #e6484d; flex: none; }
+.pm-rec.recording { background: rgba(230,72,77,0.2); border-color: rgba(230,72,77,0.55); color: #ff8a8e; }
+.pm-rec.recording .pm-rec-dot { animation: pm-rec-pulse 1.1s infinite; box-shadow: 0 0 0 3px rgba(230,72,77,0.22); }
+.pm-rec.pending-save { background: rgba(245,166,35,0.2); border-color: rgba(245,166,35,0.6); color: #ffc76e; }
+@keyframes pm-rec-pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }
+/* Narrow panels: keep the mark, the live dot and REC; drop the words. */
+@container (max-width: 400px) {
+  .pm-logo-txt, .pm-live-txt { display: none; }
+}
 
 /* ---------- URL loader ---------- */
 .pm-loader { display: flex; gap: 6px; padding: 10px 12px 4px; flex: none; }
@@ -221,6 +243,8 @@ input { font: inherit; color: #fff; }
 }
 .pm-foot label { display: flex; align-items: center; gap: 6px; font-weight: 600; }
 .pm-foot input[type="range"] { width: 96px; accent-color: #2e5cff; }
+.pm-rec-save { color: #6ea8ff; font-weight: 700; font-size: 10.5px; white-space: nowrap; padding: 2px 0; }
+.pm-rec-save:hover { text-decoration: underline; }
 .pm-src { margin-left: auto; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .pm-resize {
   position: absolute; right: 2px; bottom: 2px; width: 18px; height: 18px;

@@ -8,6 +8,7 @@
   var API = window.PMAPI;
   var Chart = window.PMChart;
   var Geom = window.PMGeom;
+  var RecorderLib = window.PMRecorder;
 
   /* ---------- formatting ---------- */
   function fmtMoney(v) {
@@ -114,8 +115,10 @@
     root.className = "pm-root" + (opts.standalone ? " pm-standalone" : "");
     root.innerHTML =
       '<div class="pm-bar">' +
-        '<span class="pm-logo"><span class="pm-logo-mark">P</span>Polymarket</span>' +
+        '<span class="pm-logo"><span class="pm-logo-mark">P</span><span class="pm-logo-txt">Polymarket</span></span>' +
         '<span class="pm-live"><span class="dot"></span><span class="pm-live-txt">Idle</span></span>' +
+        '<button class="pm-rec" data-act="record" aria-pressed="false" title="Record order-book changes, trades and wallet fills to an NDJSON file for offline strategy analysis. Click again to stop and download.">' +
+          '<span class="pm-rec-dot"></span><span class="pm-rec-txt">REC</span></button>' +
         '<span class="pm-bar-spacer"></span>' +
         '<button class="pm-icon-btn" data-act="ghost" aria-pressed="false" title="Ghost mode: click through to the page underneath (header stays clickable)">' +
           '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M3 14V7a5 5 0 0 1 10 0v7l-2-1.5L9.5 14 8 12.5 6.5 14 5 12.5z"/><circle cx="6.2" cy="7" r=".8" fill="currentColor"/><circle cx="9.8" cy="7" r=".8" fill="currentColor"/></svg></button>' +
@@ -129,6 +132,7 @@
       '<div class="pm-body"></div>' +
       '<div class="pm-foot">' +
         '<label>Opacity <input type="range" min="0" max="100" value="88"></label>' +
+        '<button class="pm-rec-save" type="button" hidden>↓ Re-download recording</button>' +
         '<span class="pm-src">Gamma + CLOB · live via WebSocket</span>' +
       "</div>" +
       '<div class="pm-resize" title="Drag to resize">⤡</div>';
@@ -145,6 +149,9 @@
       body: root.querySelector(".pm-body"),
       opacity: root.querySelector('.pm-foot input[type="range"]'),
       ghostBtn: root.querySelector('[data-act="ghost"]'),
+      recBtn: root.querySelector('[data-act="record"]'),
+      recTxt: root.querySelector(".pm-rec-txt"),
+      recSave: root.querySelector(".pm-rec-save"),
       resize: root.querySelector(".pm-resize"),
       src: root.querySelector(".pm-src"),
     };
@@ -170,6 +177,13 @@
       ghost: false,
       chartHoverX: null,
       gen: 0, // bumped on every load; guards the async init below
+      /* recording (see the recorder section below) */
+      recorder: null, recTimer: null, recWalletTimer: null,
+      recWalletSeen: new Set(), recWalletBaselineDone: false,
+      recWalletLastMaxTs: 0, recWalletErrorShown: false,
+      recKnownTokens: new Set(), recSubKey: "", recWsTypes: new Set(), lastLiveMode: null,
+      lastRecording: null,       // {filename, text, events} after a stop
+      pendingSave: false,        // last download attempt failed; REC button retries it
     };
 
     function every(ms, fn) { var t = setInterval(fn, ms); S.timers.push(t); return t; }
@@ -182,6 +196,289 @@
       el.live.className = "pm-live" + (mode === "live" ? " on" : mode === "reconnecting" ? " reconnecting" : "");
       el.liveTxt.textContent = txt;
       S.socketLive = mode === "live";
+      if (S.recorder && S.recorder.recording && S.lastLiveMode !== mode) {
+        S.recorder.note("feed_status", { status: mode });
+      }
+      S.lastLiveMode = mode;
+    }
+
+    /* ---------- recording ----------
+       The header REC button captures everything the overlay is already
+       subscribed to (full books for expanded legs — on polymarket.com the
+       feed also sends full books for all visible legs — plus top-of-book,
+       trade prints and, on .com, wallet-attributed fills polled from the
+       public Data API v2). Stop downloads one NDJSON file; see
+       lib/recorder.js for the schema and its hard limits (aggregated L2
+       books: resting orders stay anonymous, fills do not). */
+    function isRecording() {
+      return !!(S.recorder && S.recorder.recording && S.recAccepting !== false);
+    }
+
+    function fmtRecDuration(ms) {
+      var s = Math.floor(ms / 1000);
+      var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), ss = s % 60;
+      var mm = h ? String(m).padStart(2, "0") : String(m);
+      return (h ? h + ":" : "") + mm + ":" + String(ss).padStart(2, "0");
+    }
+
+    function recEnsureToken(token) {
+      if (!S.recorder || token == null) return;
+      token = String(token);
+      if (S.recKnownTokens.has(token)) return;
+      for (var i = 0; i < S.legs.length; i++) {
+        var m = S.legs[i].market;
+        var idx = m.tokens.map(String).indexOf(token);
+        if (idx === -1) continue;
+        S.recKnownTokens.add(token);
+        S.recorder.setTokenMeta(token, {
+          market_id: m.id, market_slug: m.slug || null,
+          condition_id: m.conditionId || null,
+          question: m.question || null,
+          outcome: m.outcomes[idx] || null, outcome_index: idx,
+          tick: m.tick || null, source: m.source || null,
+        });
+        return;
+      }
+      S.recKnownTokens.add(token); // unknown token: register bare, once
+      S.recorder.setTokenMeta(token, {});
+    }
+
+    function recNoteSubs(kind, ids) {
+      if (!isRecording()) return;
+      var key = kind + ":" + ids.slice().sort().join(",");
+      if (key === S.recSubKey) return;
+      S.recSubKey = key;
+      S.recorder.note("subscriptions", { kind: kind, count: ids.length, ids: ids });
+    }
+
+    function recWalletConditionIds() {
+      var ids = new Set();
+      visibleLegs().forEach(function (l) { if (l.market.conditionId) ids.add(l.market.conditionId); });
+      S.openLegs.forEach(function (key) {
+        var refs = S.legEls.get(key);
+        if (refs && refs.leg.market.conditionId) ids.add(refs.leg.market.conditionId);
+      });
+      var cl = chartLeg();
+      if (cl && cl.market.conditionId) ids.add(cl.market.conditionId);
+      return Array.from(ids);
+    }
+
+    function recWalletPoll(conditionIds) {
+      // Direct recorder check (not isRecording): the final poll during
+      // stopRecording runs after feed capture has been switched off.
+      if (!S.recorder || !S.recorder.recording || S.sample || isUS() || !API.fetchWalletTrades) {
+        return Promise.resolve();
+      }
+      var rec = S.recorder;
+      var startedAt = rec.status().startedAtMs || 0;
+      S.recWalletPolls = (S.recWalletPolls || 0) + 1;
+      return API.fetchWalletTrades(conditionIds || recWalletConditionIds(), 500).then(function (res) {
+        if (!rec.recording || S.recorder !== rec) return;
+        if (S.recWalletErrorShown) {
+          S.recWalletErrorShown = false;
+          rec.note("wallet_poll_recovered", {});
+        }
+        var fresh = 0, minTs = Infinity, maxTs = 0;
+        res.trades.forEach(function (r) {
+          var key = RecorderLib.walletTradeKey(r);
+          if (S.recWalletSeen.has(key)) return;
+          S.recWalletSeen.add(key);
+          if (r.tsMs != null) { minTs = Math.min(minTs, r.tsMs); maxTs = Math.max(maxTs, r.tsMs); }
+          // Baseline pass: fills that predate the recording are seeded as
+          // seen, not emitted (2s slack for the feed's 1s timestamps).
+          if (r.tsMs != null && r.tsMs < startedAt - 2000) return;
+          recEnsureToken(r.token);
+          rec.onWalletTrade(r);
+          fresh++;
+        });
+        // A full page whose oldest row is newer than everything the last
+        // poll returned means fills may have scrolled past unrecorded.
+        if (S.recWalletBaselineDone && res.hasMore && fresh > 0 &&
+            minTs !== Infinity && S.recWalletLastMaxTs && minTs > S.recWalletLastMaxTs) {
+          rec.note("wallet_poll_gap_suspected", {
+            page_oldest_ms: minTs, prev_newest_ms: S.recWalletLastMaxTs,
+          });
+        }
+        if (maxTs) S.recWalletLastMaxTs = Math.max(S.recWalletLastMaxTs, maxTs);
+        S.recWalletBaselineDone = true;
+      }).catch(function (e) {
+        if (!rec.recording || S.recorder !== rec) return;
+        rec.note("wallet_poll_error", { error: String((e && e.message) || e) });
+        if (!S.recWalletErrorShown) {
+          S.recWalletErrorShown = true;
+          setStatus("Recording continues, but wallet-fill lookup failed (" +
+            ((e && e.message) || e) + ") — fills will be recorded without wallet IDs.", true);
+        }
+      });
+    }
+
+    function paintRecButton() {
+      if (!el.recBtn) return;
+      var rec = isRecording();
+      el.recBtn.classList.toggle("recording", rec);
+      el.recBtn.classList.toggle("pending-save", !rec && S.pendingSave);
+      el.recBtn.setAttribute("aria-pressed", String(rec));
+      if (el.recSave) el.recSave.hidden = !S.lastRecording || rec;
+      if (rec) {
+        var st = S.recorder.status();
+        el.recTxt.textContent = fmtRecDuration(st.elapsedMs) + " · " +
+          st.events.toLocaleString();
+      } else {
+        el.recTxt.textContent = S.pendingSave ? "↓ SAVE" : "REC";
+      }
+    }
+
+    function downloadRecording(recording) {
+      var blob = new Blob([recording.text], { type: "application/x-ndjson" });
+      var url = URL.createObjectURL(blob);
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = recording.filename;
+      a.style.display = "none";
+      (document.body || root).appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+    }
+
+    function tryDownloadLast() {
+      if (!S.lastRecording) return;
+      try {
+        downloadRecording(S.lastRecording);
+        S.pendingSave = false;
+      } catch (e) {
+        S.pendingSave = true;
+        setStatus("Could not download the recording (" + ((e && e.message) || e) +
+          "). It is kept in memory — click ↓ SAVE in the header to retry.", true);
+      }
+      paintRecButton();
+    }
+
+    function recFilename() {
+      var slug = (S.ev && (S.ev.slug || "")) || "market";
+      slug = String(slug).replace(/[^a-z0-9\-]+/gi, "-").slice(0, 60) || "market";
+      var d = new Date();
+      function p(n) { return String(n).padStart(2, "0"); }
+      return "polymarket-book-" + slug + "-" + d.getFullYear() + p(d.getMonth() + 1) +
+        p(d.getDate()) + "-" + p(d.getHours()) + p(d.getMinutes()) + p(d.getSeconds()) + ".jsonl";
+    }
+
+    function startRecording() {
+      if (!RecorderLib) { setStatus("Recorder library missing (lib/recorder.js).", true); return; }
+      if (!S.ev) { setStatus("Load a market first, then hit REC.", true); return; }
+      if (isRecording()) return;
+      S.recorder = RecorderLib.createRecorder();
+      S.recAccepting = true;
+      S.recKnownTokens = new Set();
+      S.recWalletSeen = new Set();
+      S.recWalletBaselineDone = false;
+      S.recWalletLastMaxTs = 0;
+      S.recWalletErrorShown = false;
+      S.recWalletPolls = 0;
+      S.recSubKey = "";
+      S.recWsTypes = new Set();
+      S.legs.forEach(function (leg) {
+        leg.market.tokens.forEach(function (t) { recEnsureToken(t); });
+      });
+      S.recorder.start({
+        source: S.ev.source || (isUS() ? "us" : "intl"),
+        sample: S.sample,
+        url: S.url,
+        scope: "on_screen_subscriptions",
+        event: {
+          id: S.ev.id, slug: S.ev.slug, title: S.ev.title,
+          source_url: S.ev.sourceUrl || null, source: S.ev.source || null,
+          volume: S.ev.volume, liquidity: S.ev.liquidity, end_date: S.ev.endDate || null,
+        },
+        markets: S.ev.markets.map(function (m) {
+          return { id: m.id, slug: m.slug || null, condition_id: m.conditionId || null,
+            question: m.question || null, tick: m.tick || null,
+            outcomes: m.outcomes, tokens: m.tokens.map(String) };
+        }),
+      });
+      // Seed ground truth from books already on screen.
+      S.books.forEach(function (book, token) {
+        recEnsureToken(token);
+        S.recorder.observeBook(token, bookLevels(book, "bids"), bookLevels(book, "asks"), {
+          source: "seed_at_start", tick: book.tick, last: book.last, checkpoint: true,
+        });
+      });
+      S.recorder.note("recording_started", { seeded_books: S.books.size });
+      if (isUS()) {
+        S.recorder.note("us_mirror_books", {
+          note: "polymarket.us has one book per market; outcome_index 1 books " +
+            "(source *_mirror) are derived mirrors of outcome_index 0, not independent liquidity.",
+        });
+      }
+      paintRecButton();
+      S.recTimer = setInterval(function () {
+        if (!isRecording()) return;
+        if (S.recorder.status().truncated) {
+          setStatus("Recording hit the event cap and was saved.", true);
+          stopRecording("event_cap", { download: true });
+          return;
+        }
+        paintRecButton();
+      }, 500);
+      subscribeVisible();  // records the current subscription set as a note
+      recWalletPoll();  // baseline pass, then every 4s
+      S.recWalletTimer = setInterval(recWalletPoll, 4000);
+      setStatus("Recording order book" + (isUS() || S.sample ? "" : " + wallet fills") +
+        " — click the timer in the header to stop and download.");
+    }
+
+    function stopRecording(reason, opts) {
+      opts = opts || {};
+      if (!isRecording()) return Promise.resolve(null);
+      var rec = S.recorder;
+      S.recAccepting = false;  // feeds stop here; final wallet poll still lands
+      if (S.recTimer) { clearInterval(S.recTimer); S.recTimer = null; }
+      if (S.recWalletTimer) { clearInterval(S.recWalletTimer); S.recWalletTimer = null; }
+      var filename = recFilename();
+      var wantCoverage = !S.sample && !isUS(); // capture before any market switch
+      var finalIds = recWalletConditionIds(); // capture before any market switch
+      // One last wallet poll so fills from the final seconds get attributed.
+      var finalPoll = opts.finalPoll === false ? Promise.resolve()
+        : Promise.race([recWalletPoll(finalIds), new Promise(function (r) { setTimeout(r, 6000); })]);
+      return finalPoll.then(function () {
+        var extra = null;
+        if (wantCoverage) {
+          var newestFill = S.recWalletLastMaxTs || null;
+          extra = { wallet_coverage: {
+            polls: S.recWalletPolls || 0,
+            rows_seen: S.recWalletSeen.size,
+            fills_recorded: (rec.status().counts || {}).wallet_trade || 0,
+            newest_fill_server_ms: newestFill,
+            unattributed_tail_ms: newestFill ? Math.max(0, Date.now() - newestFill) : null,
+            note: "The public trades feed indexes in bursts (observed minutes apart). " +
+              "Fills after newest_fill_server_ms may exist on-chain but were not yet " +
+              "visible to the poller; trim the tail or re-fetch /v2/trades to backfill.",
+          } };
+        }
+        var summary = rec.stop(reason || "user", extra);
+        S.lastRecording = { filename: filename, text: rec.toNDJSON(),
+          events: rec.status().events, summary: summary };
+        if (S.recorder === rec) S.recorder = null;
+        paintRecButton();
+        if (opts.download !== false) tryDownloadLast();
+        if (!S.pendingSave) {
+          var tailNote = "";
+          if (extra && extra.wallet_coverage) {
+            var cov = extra.wallet_coverage;
+            tailNote = cov.fills_recorded
+              ? " Wallet fills: " + cov.fills_recorded + " recorded" +
+                (cov.unattributed_tail_ms > 30000
+                  ? ", newest ~" + Math.round(cov.unattributed_tail_ms / 1000) +
+                    "s before stop (the public feed indexes in bursts — see wallet_coverage)."
+                  : ".")
+              : " No wallet fills had been indexed by the public feed yet " +
+                "(it updates in bursts; see wallet_coverage in the file).";
+          }
+          setStatus("Recording saved: " + filename + " (" +
+            S.lastRecording.events.toLocaleString() + " events)." + tailNote);
+        }
+        return S.lastRecording;
+      });
     }
 
     /* ---------- legs ---------- */
@@ -562,7 +859,14 @@
       return map;
     }
 
-    function applyBookSnapshot(tokenId, snap) {
+    function levelsArray(x) {
+      if (x instanceof Map) {
+        return Array.from(x.entries()).map(function (e) { return { price: e[0], size: e[1] }; });
+      }
+      return x || [];
+    }
+
+    function applyBookSnapshot(tokenId, snap, src) {
       tokenId = String(tokenId);
       S.books.set(tokenId, {
         bids: snap.bids instanceof Map ? snap.bids : levelsToMap(snap.bids),
@@ -571,6 +875,19 @@
         last: snap.lastTradePrice != null ? snap.lastTradePrice : (snap.last != null ? snap.last : null),
         ts: Date.now(),
       });
+      if (isRecording()) {
+        recEnsureToken(tokenId);
+        S.recorder.observeBook(tokenId, levelsArray(snap.bids), levelsArray(snap.asks), {
+          source: (src && src.source) || "book_snapshot",
+          serverTs: src && src.serverTs != null ? src.serverTs
+            : (snap.serverTs != null ? snap.serverTs : null),
+          hash: (src && src.hash) || snap.hash || null,
+          tick: snap.tickSize || snap.tick || null,
+          last: snap.lastTradePrice != null ? snap.lastTradePrice
+            : (snap.last != null ? snap.last : null),
+          checkpoint: !!(src && src.checkpoint),
+        });
+      }
       syncQuoteFromBook(tokenId);
       queueBookRender(tokenId);
     }
@@ -597,13 +914,23 @@
     function onWsMessage(msg) {
       if (!msg || S.destroyed) return;
       var type = msg.event_type || msg.type;
+      var serverTs = msg.timestamp != null ? API.num(msg.timestamp) : null;
       if (type === "book") {
         applyBookSnapshot(msg.asset_id, {
           bids: msg.bids, asks: msg.asks,
           lastTradePrice: msg.last_trade_price != null ? API.num(msg.last_trade_price) : null,
-        });
+        }, { source: "ws_book", serverTs: serverTs, hash: msg.hash || null, checkpoint: true });
       } else if (type === "price_change") {
         (msg.price_changes || []).forEach(function (c) {
+          if (isRecording()) {
+            recEnsureToken(c.asset_id);
+            S.recorder.onPriceChange({
+              token: c.asset_id, side: c.side, price: c.price, size: c.size,
+              bestBid: c.best_bid != null && c.best_bid !== "" ? API.num(c.best_bid) : null,
+              bestAsk: c.best_ask != null && c.best_ask !== "" ? API.num(c.best_ask) : null,
+              source: "ws_price_change", serverTs: serverTs,
+            });
+          }
           var tok = String(c.asset_id);
           var book = S.books.get(tok);
           if (book) {
@@ -620,6 +947,15 @@
           queueBookRender(tok);
         });
       } else if (type === "last_trade_price") {
+        if (isRecording()) {
+          recEnsureToken(msg.asset_id);
+          S.recorder.onTrade({
+            token: msg.asset_id, price: msg.price, size: msg.size, side: msg.side,
+            feeRateBps: msg.fee_rate_bps != null ? msg.fee_rate_bps : null,
+            txHash: msg.transaction_hash || null,
+            source: "ws_last_trade_price", serverTs: serverTs,
+          });
+        }
         var t2 = String(msg.asset_id);
         var q2 = S.quotes.get(t2) || {};
         q2.last = API.num(msg.price);
@@ -634,7 +970,19 @@
       } else if (type === "tick_size_change") {
         var b3 = S.books.get(String(msg.asset_id));
         if (b3) b3.tick = API.num(msg.new_tick_size, b3.tick);
+        if (isRecording()) {
+          recEnsureToken(msg.asset_id);
+          S.recorder.setTokenMeta(String(msg.asset_id), { tick: API.num(msg.new_tick_size) });
+          S.recorder.note("tick_size_change", {
+            token: String(msg.asset_id),
+            old_tick: msg.old_tick_size != null ? API.num(msg.old_tick_size) : null,
+            new_tick: API.num(msg.new_tick_size),
+          });
+        }
         queueBookRender(msg.asset_id);
+      } else if (isRecording() && type && !S.recWsTypes.has(String(type))) {
+        S.recWsTypes.add(String(type));
+        S.recorder.note("ws_event_unhandled", { event_type: String(type) });
       }
     }
 
@@ -670,6 +1018,7 @@
       var cl = chartLeg();
       if (cl) book.push(cl.market.usSlug);
       var lite = visibleLegs().map(function (l) { return l.market.usSlug; });
+      recNoteSubs("us_book+lite", book.concat(lite));
       S.usStream.setChannels(book, lite);
     }
 
@@ -694,6 +1043,16 @@
       if (msg.last != null) { q0.last = msg.last; q1.last = +(1 - msg.last).toFixed(4); }
       S.quotes.set(t0, q0); S.quotes.set(t1, q1);
       updateLivePx(t0); updateLivePx(t1);
+      if (isRecording()) {
+        recEnsureToken(t0); recEnsureToken(t1);
+        S.recorder.onQuote({ token: t0, bid: q0.bid, ask: q0.ask, last: q0.last,
+          source: "us_lite" });
+        S.recorder.onQuote({ token: t1, bid: q1.bid, ask: q1.ask, last: q1.last,
+          source: "us_lite_mirror" });
+        if (msg.sharesTraded != null) {
+          S.recorder.onMarketStats(t0, { sharesTraded: msg.sharesTraded }, "us_lite");
+        }
+      }
       queueBookRender(t0);
     }
 
@@ -712,6 +1071,7 @@
       var chartRefs = S.chartLegKey && S.legEls.get(S.chartLegKey);
       if (chartRefs) chartRefs.leg.market.tokens.forEach(function (t) { if (t) ids.push(t); });
       var uniq = Array.from(new Set(ids.map(String))).slice(0, MAX_SUBS);
+      recNoteSubs("clob_tokens", uniq);
       if (uniq.length) S.socket.subscribe(uniq);
     }
 
@@ -728,8 +1088,13 @@
     function applyUSBook(m, res) {
       m.tokens.forEach(function (tok, i) {
         var s = res.sides && res.sides[i];
-        if (s) applyBookSnapshot(tok, { bids: s.bids, asks: s.asks, tick: m.tick || 0.01, last: s.lastTradePrice });
+        if (s) applyBookSnapshot(tok, { bids: s.bids, asks: s.asks, tick: m.tick || 0.01, last: s.lastTradePrice },
+          { source: i === 0 ? "us_book" : "us_book_mirror" });
       });
+      if (isRecording() && res.meta && m.tokens[0]) {
+        recEnsureToken(m.tokens[0]);
+        S.recorder.onMarketStats(m.tokens[0], res.meta, "us_book");
+      }
       if (res.meta && res.meta.notionalTraded != null && res.meta.notionalTraded !== m.volume) {
         m.volume = res.meta.notionalTraded;
         legsForUSSlug(m.usSlug).forEach(function (leg) {
@@ -753,7 +1118,7 @@
       S.socket.subscribe([tok]);
       if (!S.books.has(String(tok))) {
         API.fetchBook(tok).then(function (snap) {
-          if (!S.destroyed) applyBookSnapshot(tok, snap);
+          if (!S.destroyed) applyBookSnapshot(tok, snap, { source: "rest_book", checkpoint: true });
         }).catch(function () { /* WS snapshot will fill it */ });
       } else {
         renderBook(leg);
@@ -877,7 +1242,7 @@
           var refs = S.legEls.get(key);
           if (!refs) return;
           var tok = legToken(refs.leg);
-          if (tok) API.fetchBook(tok).then(function (s) { applyBookSnapshot(tok, s); }).catch(function () {});
+          if (tok) API.fetchBook(tok).then(function (s) { applyBookSnapshot(tok, s, { source: "rest_poll", checkpoint: true }); }).catch(function () {});
         });
       });
       // US REST fallback while the realtime stream is down: rotate through
@@ -945,6 +1310,7 @@
       S.gen++;
       url = String(url || "").trim();
       if (!url) { setStatus("Paste a Polymarket market or event URL first.", true); return Promise.resolve(); }
+      if (isRecording()) stopRecording("market_switch", { download: true });
       resetMarketState();
       S.url = url;
       el.input.value = url;
@@ -1004,11 +1370,12 @@
         bids.set(bp, Math.round(200 + Math.random() * 4000));
         asks.set(ap, Math.round(200 + Math.random() * 4000));
       }
-      applyBookSnapshot(tok, { bids: bids, asks: asks, tick: 0.01, last: mid });
+      applyBookSnapshot(tok, { bids: bids, asks: asks, tick: 0.01, last: mid }, { source: "sample" });
     }
 
     function loadSample() {
       S.gen++;
+      if (isRecording()) stopRecording("market_switch", { download: true });
       resetMarketState();
       S.sample = true;
       S.url = null;
@@ -1084,6 +1451,15 @@
       else el.ghostBtn.style.display = "none";
     }
     applyOpacity();
+    if (el.recBtn) {
+      el.recBtn.addEventListener("click", function () {
+        if (isRecording()) stopRecording("user", { download: true });
+        else if (S.pendingSave && S.lastRecording) tryDownloadLast();
+        else startRecording();
+      });
+      paintRecButton();
+    }
+    if (el.recSave) el.recSave.addEventListener("click", tryDownloadLast);
     root.querySelector('[data-act="min"]').addEventListener("click", function () {
       root.classList.toggle("pm-minimized");
       if (opts.frameEl) opts.frameEl.style.height = root.classList.contains("pm-minimized") ? "44px" : (opts.frameEl.dataset.h || "640px");
@@ -1181,8 +1557,20 @@
       loadUrl: loadUrl,
       loadSample: loadSample,
       setGhost: setGhost,
+      startRecording: startRecording,
+      stopRecording: stopRecording,
+      isRecording: isRecording,
+      recordingStatus: function () {
+        return S.recorder ? S.recorder.status()
+          : { recording: false, events: S.lastRecording ? S.lastRecording.events : 0,
+              hasExport: !!S.lastRecording };
+      },
+      getLastRecording: function () { return S.lastRecording; },
       focusInput: function () { el.input.focus(); el.input.select(); },
       destroy: function () {
+        if (isRecording()) stopRecording("destroyed", { download: true, finalPoll: false });
+        if (S.recTimer) { clearInterval(S.recTimer); S.recTimer = null; }
+        if (S.recWalletTimer) { clearInterval(S.recWalletTimer); S.recWalletTimer = null; }
         S.destroyed = true;
         resetMarketState();
         window.removeEventListener("resize", drawChart);
